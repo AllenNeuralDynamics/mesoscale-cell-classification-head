@@ -1,21 +1,57 @@
 [project]
-name = "mypackage"
+name = "mesoscale-cell-classification-head"
 version = "0.1.0"
 
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 dependencies = [
-    "pytest>=8.3.5",
-    "ruff>=0.9.9",
+    "aind-lightsheet-mae>=0.1.0,<1",
+    "torch>=2.0.0,<3",
+    "cupy-cuda12x>=13.0.0,<14",
+    "monai>=1.3.0,<2",
+    "scikit-learn>=1.4.0,<2",
+    "dask[array]>=2024.1.0,<2025",
+    "pandas>=2.0.0,<3",
+    "s3fs>=2024.1.0,<2025",
+    "tqdm>=4.0.0,<5",
 ]
 
 [project.optional-dependencies]
-docs = [
-    'Sphinx',
-    'sphinx-jinja',
-    'furo',
-    'docutils'
+dev = [
+    "pytest>=8.0.0,<9",
+    "pytest-cov>=5.0.0,<6",
+    "ruff>=0.9.0,<1",
 ]
+docs = [
+    "mkdocs>=1.5.0,<2",
+    "mkdocstrings[python]>=0.24.0,<1",
+    "mkdocs-material>=9.0.0,<10",
+]
+
+[tool.uv.sources]
+aind-lightsheet-mae = { git = "https://github.com/AllenNeuralDynamics/aind-lightsheet-mae.git" }
 
 [tool.pytest.ini_options]
 pythonpath = ["src", "tests"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "D"]
+ignore = [
+    "N812",  # torch.nn.functional as F is a universal PyTorch convention
+    "N806",  # uppercase dimension names (C, D, H, W) are standard in ML code
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["D101", "D102", "D103"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "numpy"
+
+[tool.coverage.run]
+source = ["mesoscale_cell_classification_head"]
+
+[tool.coverage.report]
+fail_under = 100
