@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import logging
 import warnings
+from functools import partial
 
 import cupy as cp
 import dask.array as da
@@ -31,6 +32,8 @@ from mesoscale_cell_classification_head.feature_extraction import (
     run_batch,
 )
 from mesoscale_cell_classification_head.spatial import greedy_cover_gpu
+
+from .preprocessing import apply_transform, zscore_val_augmentations
 
 logger = logging.getLogger(__name__)
 
@@ -221,6 +224,9 @@ def train(
     """
     ipca = IncrementalPCA(n_components=cfg["n_pca_components"], whiten=True)
     kmeans: OnlineKMeans | None = None
+    val_transform = zscore_val_augmentations()
+    preprocessing_func = partial(apply_transform, transform=val_transform)
+
     boxes_for_ipca = 0
     processed_boxes = 0
 
@@ -236,7 +242,12 @@ def train(
         if not batch_chunks:
             continue
 
-        feature_maps = run_batch(batch_chunks, reconstruction_model, device)
+        feature_maps = run_batch(
+            batch_chunks=batch_chunks,
+            reconstruction_model=reconstruction_model,
+            device=device,
+            preprocessing_func=preprocessing_func,
+        )
         feature_maps = torch.nan_to_num(
             feature_maps, nan=float(torch.finfo(feature_maps.dtype).tiny)
         )
@@ -364,6 +375,9 @@ def infer(
     """
     all_points: list[np.ndarray] = []
     all_labels: list[np.ndarray] = []
+    val_transform = zscore_val_augmentations()
+    preprocessing_func = partial(apply_transform, transform=val_transform)
+
 
     n_boxes = min(cfg["max_boxes"], len(boxes))
     for batch_start in tqdm(
@@ -377,7 +391,12 @@ def infer(
         if not batch_chunks:
             continue
 
-        feature_maps = run_batch(batch_chunks, reconstruction_model, device)
+        feature_maps = run_batch(
+            batch_chunks=batch_chunks,
+            reconstruction_model=reconstruction_model,
+            device=device,
+            preprocessing_func=preprocessing_func,
+        )
         feature_maps = torch.nan_to_num(
             feature_maps, nan=float(torch.finfo(feature_maps.dtype).tiny)
         )

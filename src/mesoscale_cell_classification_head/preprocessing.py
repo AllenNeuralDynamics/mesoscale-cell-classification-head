@@ -248,3 +248,25 @@ def compose_percentile_normalization_per_dataset(
             ToTensord(keys=["image"], dtype=torch.float32),
         ]
     )
+
+def apply_transform(
+    batch: Sequence[np.ndarray],
+    transform: Transform
+):
+    """Apply a MONAI transform to a batch of images.
+
+    Parameters
+    ----------
+    transform : Transform
+        MONAI-style transform to apply to each image in the batch.
+    batch : Sequence[np.ndarray]
+        List or array of images to transform.
+
+    Returns
+    -------
+    torch.Tensor
+        Batch of transformed images stacked into a single tensor.
+    """
+    return torch.stack(
+        [transform({"image": img})["image"] for img in batch], dim=0
+    )
