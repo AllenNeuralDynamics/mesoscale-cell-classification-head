@@ -458,7 +458,8 @@ def main(args: argparse.Namespace | None = None) -> None:
     )
 
     if not boxes:
-        raise RuntimeError("greedy_cover_gpu returned no boxes — check input coordinates.")
+        warnings.warn("greedy_cover_gpu returned no boxes — check input coordinates.")
+        return
 
     shuffled = np.random.permutation(len(boxes))
     boxes = [boxes[i] for i in shuffled]
