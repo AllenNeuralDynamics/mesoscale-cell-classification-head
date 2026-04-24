@@ -113,10 +113,11 @@ def run_batch(
     batch = torch.from_numpy(stacked).unsqueeze(1).to(device).half()
 
     # Percentile clipping before z-score to avoid std being dominated by bright outliers
-    p1 = torch.quantile(batch.float(), 0.01, dim=None, keepdim=True)
-    p99 = torch.quantile(batch.float(), 0.99, dim=None, keepdim=True)
-    batch = torch.clamp(batch, p1, p99)
+    # p1 = torch.quantile(batch.float(), 0.01, dim=None, keepdim=True)
+    # p99 = torch.quantile(batch.float(), 0.99, dim=None, keepdim=True)
+    # batch = torch.clamp(batch, p1, p99)
 
+    # TODO Use the same normalisation as the MAE pretraining
     batch = (batch - batch.mean(dim=(2, 3, 4), keepdim=True)) / (
         batch.std(dim=(2, 3, 4), keepdim=True) + 1e-6
     )

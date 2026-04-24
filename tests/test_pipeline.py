@@ -37,6 +37,7 @@ def _make_boxes(
 def _make_zarr_mock(shape: tuple[int, ...]) -> MagicMock:
     arr = np.zeros(shape, dtype=np.float32)
     mock = MagicMock()
+    mock.shape = shape
     mock.__getitem__ = MagicMock(return_value=MagicMock(compute=MagicMock(return_value=arr)))
     return mock
 
@@ -81,9 +82,50 @@ class TestLoadBoxBatch:
         box_cells = [np.array([0], dtype=np.int64)]
         zarr = _make_zarr_mock((64, 64, 64))
 
-        chunks, points, starts = _load_box_batch([0], boxes, box_cells, cell_zyx, zarr)
+        chunks, points, starts = _load_box_batch(
+            [0], boxes, box_cells, cell_zyx, zarr, overlap=0, box_dim=8
+        )
         assert len(chunks) == 1
         assert chunks[0].shape == (8, 8, 8)
+
+    def test_overlap_shifts_origin(self) -> None:
+        # box starts at z0=16; halo=5; pz0=max(0, 16-5)=11
+        cell_zyx = np.array([[20, 20, 20]], dtype=np.int64)
+        boxes = [(np.array([16, 16, 16]), np.array([134, 134, 134]))]
+        box_cells = [np.array([0], dtype=np.int64)]
+        zarr = _make_zarr_mock((512, 512, 512))
+
+        _, _, starts = _load_box_batch(
+            [0], boxes, box_cells, cell_zyx, zarr, overlap=10, box_dim=128
+        )
+        _, padded_origin = starts[0]
+        assert int(padded_origin[0]) == 11  # max(0, 16 - 5)
+
+    def test_volume_edge_clamp(self) -> None:
+        # box starts at z0=0; halo=5; max(0, 0-5)=0 — clamped at volume edge
+        cell_zyx = np.array([[4, 4, 4]], dtype=np.int64)
+        boxes = [(np.array([0, 0, 0]), np.array([118, 118, 118]))]
+        box_cells = [np.array([0], dtype=np.int64)]
+        zarr = _make_zarr_mock((512, 512, 512))
+
+        _, _, starts = _load_box_batch(
+            [0], boxes, box_cells, cell_zyx, zarr, overlap=10, box_dim=128
+        )
+        _, padded_origin = starts[0]
+        assert int(padded_origin[0]) == 0
+
+    def test_global_coords_recovered(self) -> None:
+        # local_coord + padded_start must equal the original world coordinate
+        world_cell = np.array([[20, 20, 20]], dtype=np.int64)
+        boxes = [(np.array([16, 16, 16]), np.array([134, 134, 134]))]
+        box_cells = [np.array([0], dtype=np.int64)]
+        zarr = _make_zarr_mock((512, 512, 512))
+
+        _, points, starts = _load_box_batch(
+            [0], boxes, box_cells, world_cell, zarr, overlap=10, box_dim=128
+        )
+        _, padded_origin = starts[0]
+        np.testing.assert_array_equal(points[0] + padded_origin, world_cell[0])
 
 
 # ---------------------------------------------------------------------------
@@ -130,6 +172,8 @@ def test_train_returns_ipca(n_boxes: int, tmp_path, monkeypatch) -> None:
         "ipca_warmup_boxes": 0,   # skip warmup so kmeans is always initialised
         "store_kmeans_every_n": 9999,
         "lr_kmeans": 0.1,
+        "overlap": 0,
+        "box_dim": 128,
     }
 
     ipca, kmeans = train(boxes, box_cells, cell_zyx, zarr, model, device, cfg)
@@ -161,6 +205,8 @@ def test_infer_returns_arrays(tmp_path, monkeypatch) -> None:
         "batch_size": 2,
         "jump": 8,
         "n_pca_components": N_PCA,
+        "overlap": 0,
+        "box_dim": 128,
     }
 
     points, labels = infer(boxes, box_cells, cell_zyx, zarr, model, device, ipca, kmeans, cfg)

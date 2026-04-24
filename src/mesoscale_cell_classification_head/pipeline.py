@@ -34,10 +34,22 @@ from mesoscale_cell_classification_head.spatial import greedy_cover_gpu
 
 logger = logging.getLogger(__name__)
 
-def _default_config() -> dict:
+def _default_config(
+    box_dim: int = 128,
+    patch_size: int = 4,
+    overlap: int = 10,
+) -> dict:
+    box_core = box_dim - overlap
+    vox = box_dim // patch_size
     return {
-        "box_size": cp.array([128, 128, 128], dtype=cp.int64),
-        "vox": 32,
+        # Greedy cover uses the core box.  Each loaded chunk is box_dim cubic, centred
+        # on the core, so border cells have halo = overlap//2 voxels of real data
+        # context on every face instead of zero-padding.
+        "box_size": cp.array([box_core] * 3, dtype=cp.int64),
+        "box_dim": box_dim,
+        "overlap": overlap,
+        "patch_size": patch_size,
+        "vox": vox,
         "scale": 1,
         "max_boxes": 30000,
         "batch_size": 4,
@@ -94,49 +106,79 @@ def _load_box_batch(
     box_cells_ids: list[np.ndarray],
     cell_zyx_ds: np.ndarray,
     loaded_zarr: da.Array,
+    overlap: int = 0,
+    box_dim: int = 128,
 ) -> tuple[list[np.ndarray], list[np.ndarray], list[tuple[int, np.ndarray]]]:
     """Load image chunks and local cell coordinates for a batch of boxes.
+
+    Each chunk is a ``box_dim³`` window centred on the assignment box (core).
+    The ``overlap // 2`` voxels on each face are real image data from the
+    neighbouring box's territory, giving border cells a complete encoder
+    context.  At volume edges the window is clamped to ``[0, zarr_shape)``
+    and ``pad_to_shape`` (inside :func:`run_batch`) fills the shortfall with
+    zeros.
 
     Parameters
     ----------
     batch_indices : list[int]
-        Indices into boxes / box_cells_ids to load.
+        Indices into ``boxes`` / ``box_cells_ids`` to load.
     boxes : list[tuple[np.ndarray, np.ndarray]]
-        List of (start, end) world-coordinate arrays.
+        List of ``(start, end)`` world-coordinate arrays for the core boxes.
     box_cells_ids : list[np.ndarray]
-        Parallel list of cell-index arrays (into cell_zyx_ds).
+        Parallel list of cell-index arrays (into ``cell_zyx_ds``).
     cell_zyx_ds : np.ndarray
-        Full (N, 3) downsampled coordinate array.
+        Full ``(N, 3)`` downsampled coordinate array.
     loaded_zarr : da.Array
         Dask array for the image.
+    overlap : int
+        Total voxels of halo per axis.  ``halo_per_face = overlap // 2``.
+        When ``0`` (default) the window is exactly the core box — no change
+        in behaviour.
+    box_dim : int
+        Side length of the loaded chunk, i.e. the encoder input size.
+        Must equal ``box_core + overlap``.
 
     Returns
     -------
     batch_chunks : list[np.ndarray]
-        Image sub-volumes, one per non-empty box.
+        Image sub-volumes of shape ``≤ (box_dim, box_dim, box_dim)``, one
+        per non-empty box.
     batch_points : list[np.ndarray]
-        Cell coordinates in local box frame, parallel to batch_chunks.
+        Cell coordinates in the **padded chunk frame**, parallel to
+        ``batch_chunks``.
     batch_starts : list[tuple[int, np.ndarray]]
-        (original_box_index, start_offset) pairs, parallel to
-        batch_chunks.
+        ``(original_box_index, padded_start_zyx)`` pairs.  Adding
+        ``padded_start`` to the local coordinates recovers world coordinates.
     """
+    halo = overlap // 2
+
     batch_chunks: list[np.ndarray] = []
     batch_points: list[np.ndarray] = []
     batch_starts: list[tuple[int, np.ndarray]] = []
 
     for i in batch_indices:
-        start, end = boxes[i]
+        start, _ = boxes[i]
         z0, y0, x0 = map(int, start)
-        z1, y1, x1 = map(int, end)
+
         curr_box_points = cell_zyx_ds[box_cells_ids[i]]
         if len(curr_box_points) == 0:
             continue
-        batch_points.append(curr_box_points - np.array([z0, y0, x0]))
-        batch_starts.append((i, np.array([z0, y0, x0])))
+
+        pz0 = max(0, z0 - halo)
+        py0 = max(0, y0 - halo)
+        px0 = max(0, x0 - halo)
+
         chunk = np.asarray(
-            loaded_zarr[(slice(z0, z1), slice(y0, y1), slice(x0, x1))].compute(),
+            loaded_zarr[
+                pz0 : pz0 + box_dim,
+                py0 : py0 + box_dim,
+                px0 : px0 + box_dim,
+            ].compute(),
             dtype=np.float32,
         )
+        padded_start = np.array([pz0, py0, px0])
+        batch_points.append(curr_box_points - padded_start)
+        batch_starts.append((i, padded_start))
         batch_chunks.append(chunk)
 
     return batch_chunks, batch_points, batch_starts
@@ -188,7 +230,8 @@ def train(
     ):
         batch_indices = list(range(batch_start, min(batch_start + cfg["batch_size"], n_boxes)))
         batch_chunks, batch_points, batch_starts = _load_box_batch(
-            batch_indices, boxes, box_cells_ids, cell_zyx_ds, loaded_zarr
+            batch_indices, boxes, box_cells_ids, cell_zyx_ds, loaded_zarr,
+            overlap=cfg["overlap"], box_dim=cfg["box_dim"],
         )
         if not batch_chunks:
             continue
@@ -328,7 +371,8 @@ def infer(
     ):
         batch_indices = list(range(batch_start, min(batch_start + cfg["batch_size"], n_boxes)))
         batch_chunks, batch_points, batch_starts = _load_box_batch(
-            batch_indices, boxes, box_cells_ids, cell_zyx_ds, loaded_zarr
+            batch_indices, boxes, box_cells_ids, cell_zyx_ds, loaded_zarr,
+            overlap=cfg["overlap"], box_dim=cfg["box_dim"],
         )
         if not batch_chunks:
             continue
