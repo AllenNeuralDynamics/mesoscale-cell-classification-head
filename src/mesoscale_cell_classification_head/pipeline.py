@@ -14,7 +14,9 @@ from __future__ import annotations
 import argparse
 import logging
 import warnings
+from collections.abc import Iterator
 from functools import partial
+from typing import Callable
 
 import cupy as cp
 import dask.array as da
@@ -63,6 +65,7 @@ def _default_config(
         "ipca_warmup_boxes": 200,
         "store_kmeans_every_n": 500,
         "lr_kmeans": 0.03,
+        "head_batch_size": 1024,
     }
 
 def load_data(
@@ -114,44 +117,44 @@ def _load_box_batch(
 ) -> tuple[list[np.ndarray], list[np.ndarray], list[tuple[int, np.ndarray]]]:
     """Load image chunks and local cell coordinates for a batch of boxes.
 
-    Each chunk is a ``box_dim³`` window centred on the assignment box (core).
-    The ``overlap // 2`` voxels on each face are real image data from the
+    Each chunk is a box_dim³ window centred on the assignment box (core).
+    The overlap // 2 voxels on each face are real image data from the
     neighbouring box's territory, giving border cells a complete encoder
-    context.  At volume edges the window is clamped to ``[0, zarr_shape)``
-    and ``pad_to_shape`` (inside :func:`run_batch`) fills the shortfall with
+    context.  At volume edges the window is clamped to [0, zarr_shape)
+    and pad_to_shape (inside :func:`run_batch`) fills the shortfall with
     zeros.
 
     Parameters
     ----------
     batch_indices : list[int]
-        Indices into ``boxes`` / ``box_cells_ids`` to load.
+        Indices into boxes / box_cells_ids to load.
     boxes : list[tuple[np.ndarray, np.ndarray]]
-        List of ``(start, end)`` world-coordinate arrays for the core boxes.
+        List of (start, end) world-coordinate arrays for the core boxes.
     box_cells_ids : list[np.ndarray]
-        Parallel list of cell-index arrays (into ``cell_zyx_ds``).
+        Parallel list of cell-index arrays (into cell_zyx_ds).
     cell_zyx_ds : np.ndarray
-        Full ``(N, 3)`` downsampled coordinate array.
+        Full (N, 3) downsampled coordinate array.
     loaded_zarr : da.Array
         Dask array for the image.
     overlap : int
-        Total voxels of halo per axis.  ``halo_per_face = overlap // 2``.
-        When ``0`` (default) the window is exactly the core box — no change
+        Total voxels of halo per axis.  halo_per_face = overlap // 2.
+        When 0 (default) the window is exactly the core box — no change
         in behaviour.
     box_dim : int
         Side length of the loaded chunk, i.e. the encoder input size.
-        Must equal ``box_core + overlap``.
+        Must equal box_core + overlap.
 
     Returns
     -------
     batch_chunks : list[np.ndarray]
-        Image sub-volumes of shape ``≤ (box_dim, box_dim, box_dim)``, one
+        Image sub-volumes of shape ≤ (box_dim, box_dim, box_dim), one
         per non-empty box.
     batch_points : list[np.ndarray]
         Cell coordinates in the **padded chunk frame**, parallel to
-        ``batch_chunks``.
+        batch_chunks.
     batch_starts : list[tuple[int, np.ndarray]]
-        ``(original_box_index, padded_start_zyx)`` pairs.  Adding
-        ``padded_start`` to the local coordinates recovers world coordinates.
+        (original_box_index, padded_start_zyx) pairs.  Adding
+        padded_start to the local coordinates recovers world coordinates.
     """
     halo = overlap // 2
 
@@ -194,6 +197,7 @@ def train(
     reconstruction_model: object,
     device: torch.device,
     cfg: dict,
+    val_transform: Callable = None
 ) -> tuple[IncrementalPCA, OnlineKMeans | None]:
     """Fit IncrementalPCA and OnlineKMeans on box-extracted features.
 
@@ -213,6 +217,9 @@ def train(
         Compute device.
     cfg : dict
         Pipeline configuration (see :func:`_default_config`).
+    val_transform : Callable, optional
+        Optional transformation function applied to each batch chunk before encoding.
+        Should take and return a numpy array of the same shape.
 
     Returns
     -------
@@ -224,8 +231,9 @@ def train(
     """
     ipca = IncrementalPCA(n_components=cfg["n_pca_components"], whiten=True)
     kmeans: OnlineKMeans | None = None
-    val_transform = zscore_val_augmentations()
-    preprocessing_func = partial(apply_transform, transform=val_transform)
+    preprocessing_func = None
+    if val_transform is not None:
+        preprocessing_func = partial(apply_transform, transform=val_transform)
 
     boxes_for_ipca = 0
     processed_boxes = 0
@@ -332,25 +340,29 @@ def _cap_features(
     idx = torch.randperm(n, device=device)[:max_cells]
     return feats[idx], global_points[idx.cpu().numpy()]
 
-def infer(
+def _iter_cell_features(
     boxes: list[tuple[np.ndarray, np.ndarray]],
     box_cells_ids: list[np.ndarray],
     cell_zyx_ds: np.ndarray,
     loaded_zarr: da.Array,
     reconstruction_model: object,
     device: torch.device,
-    ipca: IncrementalPCA,
-    kmeans: OnlineKMeans,
     cfg: dict,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Assign cluster labels to all cells using frozen PCA and k-means.
+    desc: str = "Feature extraction",
+    val_transform: Callable = None
+) -> Iterator[tuple[torch.Tensor, np.ndarray]]:
+    """Yield per-cell feature vectors and world coordinates for every box.
+
+    Handles data loading, MAE encoding, and feature extraction in a single
+    pass.  Callers receive one (feats, global_points) tuple per non-empty
+    box and are responsible for any downstream classification or batching.
 
     Parameters
     ----------
     boxes : list[tuple[np.ndarray, np.ndarray]]
-        Box corners (same order as training).
+        Ordered list of (start, end) box corners.
     box_cells_ids : list[np.ndarray]
-        Parallel cell-index lists.
+        Parallel list mapping each box to cell indices in cell_zyx_ds.
     cell_zyx_ds : np.ndarray
         (N, 3) downsampled cell coordinates.
     loaded_zarr : da.Array
@@ -359,30 +371,28 @@ def infer(
         Pretrained :class:`Lightsheet3DMAE` in eval mode.
     device : torch.device
         Compute device.
-    ipca : IncrementalPCA
-        Fitted PCA transformer (frozen — not updated here).
-    kmeans : OnlineKMeans
-        Trained k-means (predict-only — centroids are not updated here).
     cfg : dict
-        Pipeline configuration (see :func:`_default_config`).
+        Pipeline configuration (see :func:`_default_config`).  Uses
+        max_boxes, batch_size, overlap, box_dim, and jump.
+    desc : str
+        Label shown on the tqdm progress bar.
+    val_transform : Callable, optional
+        Optional transformation function applied to each batch chunk before encoding.
+        Should take and return a numpy array of the same shape.
 
-    Returns
-    -------
-    all_points : np.ndarray
-        (M, 3) uint32 world coordinates of classified cells.
-    all_labels : np.ndarray
-        (M,) uint8 cluster labels parallel to all_points.
+    Yields
+    ------
+    feats : torch.Tensor
+        (N_valid, C) float32 feature matrix on device.
+    global_points : np.ndarray
+        (N_valid, 3) uint32 world coordinates parallel to feats.
     """
-    all_points: list[np.ndarray] = []
-    all_labels: list[np.ndarray] = []
-    val_transform = zscore_val_augmentations()
-    preprocessing_func = partial(apply_transform, transform=val_transform)
-
+    preprocessing_func = None
+    if val_transform is not None:
+        preprocessing_func = partial(apply_transform, transform=val_transform)
 
     n_boxes = min(cfg["max_boxes"], len(boxes))
-    for batch_start in tqdm(
-        range(0, n_boxes, cfg["batch_size"]), desc="Inference pass"
-    ):
+    for batch_start in tqdm(range(0, n_boxes, cfg["batch_size"]), desc=desc):
         batch_indices = list(range(batch_start, min(batch_start + cfg["batch_size"], n_boxes)))
         batch_chunks, batch_points, batch_starts = _load_box_batch(
             batch_indices, boxes, box_cells_ids, cell_zyx_ds, loaded_zarr,
@@ -412,26 +422,164 @@ def infer(
             if len(feats) == 0:
                 continue
 
-            feats = feats.to(device).float()
             _, start_offset = batch_starts[bidx]
             global_points = (batch_points[bidx] + start_offset)[valid_mask].astype(np.uint32)
+            yield feats.to(device).float(), global_points
 
-            reduced = torch.from_numpy(
-                ipca.transform(feats.cpu().numpy())
-            ).to(device).float()
-            labels = kmeans.predict(reduced)
 
-            all_points.append(global_points)
-            all_labels.append(labels.cpu().numpy().astype(np.uint8))
+def infer_clustering(
+    boxes: list[tuple[np.ndarray, np.ndarray]],
+    box_cells_ids: list[np.ndarray],
+    cell_zyx_ds: np.ndarray,
+    loaded_zarr: da.Array,
+    reconstruction_model: object,
+    device: torch.device,
+    ipca: IncrementalPCA,
+    kmeans: OnlineKMeans,
+    cfg: dict,
+    val_transform: Callable = None
+) -> tuple[np.ndarray, np.ndarray]:
+    """Assign cluster labels to all cells using frozen PCA and k-means.
 
-            del feats
+    Parameters
+    ----------
+    boxes : list[tuple[np.ndarray, np.ndarray]]
+        Box corners (same order as training).
+    box_cells_ids : list[np.ndarray]
+        Parallel cell-index lists.
+    cell_zyx_ds : np.ndarray
+        (N, 3) downsampled cell coordinates.
+    loaded_zarr : da.Array
+        Image data source.
+    reconstruction_model : object
+        Pretrained :class:`Lightsheet3DMAE` in eval mode.
+    device : torch.device
+        Compute device.
+    ipca : IncrementalPCA
+        Fitted PCA transformer (frozen — not updated here).
+    kmeans : OnlineKMeans
+        Trained k-means (predict-only — centroids are not updated here).
+    cfg : dict
+        Pipeline configuration (see :func:`_default_config`).
+    val_transform : Callable, optional
+        Optional transformation function applied to each batch chunk before encoding.
+        Should take and return a numpy array of the same shape.
+
+    Returns
+    -------
+    all_points : np.ndarray
+        (M, 3) uint32 world coordinates of classified cells.
+    all_labels : np.ndarray
+        (M,) uint8 cluster labels parallel to all_points.
+    """
+    all_points: list[np.ndarray] = []
+    all_labels: list[np.ndarray] = []
+
+    for feats, global_points in _iter_cell_features(
+        boxes, box_cells_ids, cell_zyx_ds, loaded_zarr,
+        reconstruction_model, device, cfg, desc="Clustering inference",
+        val_transform=val_transform,
+    ):
+        reduced = torch.from_numpy(
+            ipca.transform(feats.cpu().numpy())
+        ).to(device).float()
+        labels = kmeans.predict(reduced)
+        all_points.append(global_points)
+        all_labels.append(labels.cpu().numpy().astype(np.uint8))
 
     if not all_points:
         return np.empty((0, 3), dtype=np.uint32), np.empty(0, dtype=np.uint8)
 
-    points_np = np.concatenate(all_points, axis=0)
-    labels_np = np.concatenate(all_labels, axis=0)
-    return points_np, labels_np
+    return np.concatenate(all_points, axis=0), np.concatenate(all_labels, axis=0)
+
+
+def infer_head(
+    boxes: list[tuple[np.ndarray, np.ndarray]],
+    box_cells_ids: list[np.ndarray],
+    cell_zyx_ds: np.ndarray,
+    loaded_zarr: da.Array,
+    reconstruction_model: object,
+    device: torch.device,
+    head_model: torch.nn.Module,
+    cfg: dict,
+    val_transform: Callable = None
+) -> tuple[np.ndarray, np.ndarray]:
+    """Assign labels to all cells using a PyTorch head model.
+
+    Features from multiple boxes are accumulated into a single batch before
+    calling head_model, improving GPU utilisation compared to processing
+    one box at a time.
+
+    Parameters
+    ----------
+    boxes : list[tuple[np.ndarray, np.ndarray]]
+        Box corners (same order as training).
+    box_cells_ids : list[np.ndarray]
+        Parallel cell-index lists.
+    cell_zyx_ds : np.ndarray
+        (N, 3) downsampled cell coordinates.
+    loaded_zarr : da.Array
+        Image data source.
+    reconstruction_model : object
+        Pretrained :class:`Lightsheet3DMAE` in eval mode.
+    device : torch.device
+        Compute device.
+    head_model : torch.nn.Module
+        Classification head that maps (N, C) float32 feature vectors to
+        (N, n_classes) logits.  Must already be on device and in eval
+        mode.
+    cfg : dict
+        Pipeline configuration (see :func:`_default_config`).  Uses
+        head_batch_size (default 1024) to control how many cell
+        features are batched before each head forward pass.
+    val_transform : Callable, optional
+        Optional transformation function applied to each batch chunk before encoding.
+        Should take and return a numpy array of the same shape.
+
+    Returns
+    -------
+    all_points : np.ndarray
+        (M, 3) uint32 world coordinates of classified cells.
+    all_labels : np.ndarray
+        (M,) uint8 predicted class indices parallel to all_points.
+    """
+    head_batch_size: int = cfg.get("head_batch_size", 1024)
+
+    all_points: list[np.ndarray] = []
+    all_labels: list[np.ndarray] = []
+    acc_feats: list[torch.Tensor] = []
+    acc_points: list[np.ndarray] = []
+
+    def _flush() -> None:
+        """Flushing the accumulated features."""
+        # TODO replace this with the actual model
+        batch = torch.cat(acc_feats, dim=0)
+        pts = np.concatenate(acc_points, axis=0)
+        with torch.no_grad():
+            logits = head_model(batch)
+        labels = logits.argmax(dim=1).cpu().numpy().astype(np.uint8)
+        all_points.append(pts)
+        all_labels.append(labels)
+        acc_feats.clear()
+        acc_points.clear()
+
+    for feats, global_points in _iter_cell_features(
+        boxes, box_cells_ids, cell_zyx_ds, loaded_zarr,
+        reconstruction_model, device, cfg, desc="Head inference",
+        val_transform=val_transform,
+    ):
+        acc_feats.append(feats)
+        acc_points.append(global_points)
+        if sum(f.shape[0] for f in acc_feats) >= head_batch_size:
+            _flush()
+
+    if acc_feats:
+        _flush()
+
+    if not all_points:
+        return np.empty((0, 3), dtype=np.uint32), np.empty(0, dtype=np.uint8)
+
+    return np.concatenate(all_points, axis=0), np.concatenate(all_labels, axis=0)
 
 def main(args: argparse.Namespace | None = None) -> None:
     """Run the full cell-classification pipeline.
@@ -465,6 +613,13 @@ def main(args: argparse.Namespace | None = None) -> None:
     boxes = [boxes[i] for i in shuffled]
     box_cells_ids = [box_cells_ids[i] for i in shuffled]
 
+    # Validation transform to map the volumes to the
+    # same distribution as the encoder was trained on
+    # Note: Camilo Laiton
+    # If the model was trained with percentile norm/zscore,
+    # the same transform should be applied here.
+    val_transform = zscore_val_augmentations()
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     reconstruction_model = (
         Lightsheet3DMAE.load_from_checkpoint(args.checkpoint_path, weights_only=False)
@@ -475,7 +630,7 @@ def main(args: argparse.Namespace | None = None) -> None:
 
     ipca, kmeans = train(
         boxes, box_cells_ids, cell_zyx_ds, loaded_zarr,
-        reconstruction_model, device, cfg
+        reconstruction_model, device, cfg, val_transform=val_transform
     )
 
     if kmeans is None:
@@ -487,9 +642,10 @@ def main(args: argparse.Namespace | None = None) -> None:
         )
         return
 
-    all_points, all_labels = infer(
+    all_points, all_labels = infer_clustering(
         boxes, box_cells_ids, cell_zyx_ds, loaded_zarr,
-        reconstruction_model, device, ipca, kmeans, cfg
+        reconstruction_model, device, ipca, kmeans, cfg,
+        val_transform=val_transform,
     )
 
     assert all_points.shape[0] == all_labels.shape[0], "Points and labels misaligned!"

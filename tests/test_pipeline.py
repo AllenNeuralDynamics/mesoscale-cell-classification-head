@@ -7,11 +7,13 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 import torch
+import torch.nn as nn
 
 from mesoscale_cell_classification_head.pipeline import (
     _cap_features,
     _load_box_batch,
-    infer,
+    infer_clustering,
+    infer_head,
     train,
 )
 
@@ -180,7 +182,7 @@ def test_train_returns_ipca(n_boxes: int, tmp_path, monkeypatch) -> None:
     assert ipca is not None
 
 
-def test_infer_returns_arrays(tmp_path, monkeypatch) -> None:
+def test_infer_clustering_returns_arrays(tmp_path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
 
     from sklearn.decomposition import IncrementalPCA
@@ -194,7 +196,6 @@ def test_infer_returns_arrays(tmp_path, monkeypatch) -> None:
     model = _make_reconstruction_model(n_cells=2, n_pca=N_PCA)
     device = torch.device("cpu")
 
-    # Fit a real IPCA on random data so transform works
     ipca = IncrementalPCA(n_components=N_PCA, whiten=True)
     ipca.partial_fit(np.random.rand(N_PCA + 5, N_PCA))
 
@@ -209,7 +210,40 @@ def test_infer_returns_arrays(tmp_path, monkeypatch) -> None:
         "box_dim": 128,
     }
 
-    points, labels = infer(boxes, box_cells, cell_zyx, zarr, model, device, ipca, kmeans, cfg)
+    points, labels = infer_clustering(
+        boxes, box_cells, cell_zyx, zarr, model, device, ipca, kmeans, cfg
+    )
+    assert points.ndim == 2
+    assert labels.ndim == 1
+    assert points.shape[0] == labels.shape[0]
+
+
+def test_infer_head_returns_arrays(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    N_PCA = 8
+    N_CLASSES = 3
+    boxes, box_cells = _make_boxes(n=2, box_size=128)
+    cell_zyx = np.array([[64, 64, 64], [64, 64, 64]], dtype=np.int64)
+    zarr = _make_zarr_mock((512, 128, 128))
+    model = _make_reconstruction_model(n_cells=2, n_pca=N_PCA)
+    device = torch.device("cpu")
+
+    head_model = nn.Linear(N_PCA, N_CLASSES)
+    head_model.eval()
+
+    cfg = {
+        "max_boxes": 2,
+        "batch_size": 2,
+        "jump": 8,
+        "overlap": 0,
+        "box_dim": 128,
+        "head_batch_size": 1,
+    }
+
+    points, labels = infer_head(
+        boxes, box_cells, cell_zyx, zarr, model, device, head_model, cfg
+    )
     assert points.ndim == 2
     assert labels.ndim == 1
     assert points.shape[0] == labels.shape[0]
