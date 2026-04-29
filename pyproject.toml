@@ -5,7 +5,7 @@ version = "0.1.0"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "aind-lightsheet-mae>=0.1.0,<1",
+    "aind-lightsheet-mae @ git+ssh://git@github.com/AllenNeuralDynamics/aind-lightsheet-mae.git@model-init-update",
     "torch>=2.0.0,<3",
     "cupy-cuda12x>=13.0.0,<14",
     "monai>=1.3.0,<2",
