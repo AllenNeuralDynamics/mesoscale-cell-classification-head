@@ -31,6 +31,7 @@ from tqdm import tqdm
 from mesoscale_cell_classification_head.clustering import OnlineKMeans
 from mesoscale_cell_classification_head.feature_extraction import (
     extract_feature_vectors_torch,
+    extract_feature_vectors_torch_3d,
     run_batch,
 )
 from mesoscale_cell_classification_head.spatial import greedy_cover_gpu
@@ -66,6 +67,9 @@ def _default_config(
         "store_kmeans_every_n": 500,
         "lr_kmeans": 0.03,
         "head_batch_size": 1024,
+        "remove_cls_token": True,
+        "remove_register_tokens": True,
+        "cube_size": 30,
     }
 
 def load_data(
@@ -255,6 +259,8 @@ def train(
             reconstruction_model=reconstruction_model,
             device=device,
             preprocessing_func=preprocessing_func,
+            remove_cls_token=cfg.get("remove_cls_token", True),
+            remove_register_tokens=cfg.get("remove_register_tokens", True),
         )
         feature_maps = torch.nan_to_num(
             feature_maps, nan=float(torch.finfo(feature_maps.dtype).tiny)
@@ -264,8 +270,8 @@ def train(
             feats, valid_mask = extract_feature_vectors_torch(
                 feature_map=fm,
                 roi_centers_zyx=batch_points[bidx],
-                jump=cfg["jump"],
                 return_mask=True,
+                pad_size=cfg["box_dim"],
             )
             if len(feats) == 0:
                 continue
@@ -349,7 +355,7 @@ def _iter_cell_features(
     cfg: dict,
     desc: str = "Feature extraction",
     val_transform: Callable = None,
-    pool: bool = True,
+    use_3d_features: bool = False,
 ) -> Iterator[tuple[torch.Tensor, np.ndarray]]:
     """Yield per-cell feature vectors and world coordinates for every box.
 
@@ -404,21 +410,37 @@ def _iter_cell_features(
         feature_maps = run_batch(
             batch_chunks=batch_chunks,
             reconstruction_model=reconstruction_model,
+            remove_cls_token=cfg.get("remove_cls_token", True),
+            remove_register_tokens=cfg.get("remove_register_tokens", True),
             device=device,
             preprocessing_func=preprocessing_func,
         )
+
         feature_maps = torch.nan_to_num(
             feature_maps, nan=float(torch.finfo(feature_maps.dtype).tiny)
         )
 
+        if use_3d_features:
+            # run_batch returns (B, C, Dg, Hg, Wg); permute to channels-last
+            # (B, Dg, Hg, Wg, C) for the patch-cube extractor.
+            feature_maps = feature_maps.permute(0, 2, 3, 4, 1).contiguous()
+
         for bidx, fm in enumerate(feature_maps):
-            feats, valid_mask = extract_feature_vectors_torch(
-                feature_map=fm,
-                roi_centers_zyx=batch_points[bidx],
-                jump=cfg["jump"],
-                return_mask=True,
-                pool=pool,
-            )
+            if use_3d_features:
+                feats, valid_mask = extract_feature_vectors_torch_3d(
+                    feature_map=fm,
+                    roi_centers_zyx=batch_points[bidx],
+                    return_mask=True,
+                    cube_size=cfg["cube_size"],
+                    pad_size=cfg["box_dim"],
+                )
+            else:
+                feats, valid_mask = extract_feature_vectors_torch(
+                    feature_map=fm,
+                    roi_centers_zyx=batch_points[bidx],
+                    return_mask=True,
+                    pad_size=cfg["box_dim"],
+                )
             if len(feats) == 0:
                 continue
 
