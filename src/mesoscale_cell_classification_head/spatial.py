@@ -182,45 +182,63 @@ def greedy_cover_gpu(
         shape[2] // vox + 1,
     )
 
-    active_mask = cp.ones(coords.shape[0], dtype=cp.bool_)
     box_vox = box_size // vox
+    grid_cp = cp.array(list(grid_shape), dtype=cp.int64)
+
+    # Build histogram once; update incrementally instead of rebuilding each iter.
+    hist = build_hist_gpu(bins, grid_shape)
+    # Track remaining points as a shrinking index array (avoids cp.where each iter).
+    active_indices = cp.arange(coords.shape[0], dtype=cp.int64)
 
     boxes: list[tuple[np.ndarray, np.ndarray]] = []
     box_cells: list[np.ndarray] = []
 
-    total_points = int(coords.shape[0])
-    pbar = tqdm(total=total_points, desc="Covered points")
+    if verbose:
+        print(f"greedy_cover_gpu: {len(active_indices)} points, "
+              f"grid_shape={grid_shape}, box_vox={box_vox.tolist()}, "
+              f"hist_sum={int(hist.sum())}, hist_max={int(hist.max())}")
 
-    while cp.any(active_mask):
-        hist = build_hist_gpu(bins[active_mask], grid_shape)
-        integral = integral_image(hist)
+    pbar = tqdm(total=int(coords.shape[0]), desc="Covered points")
+
+    while len(active_indices) > 0:
+        if int(hist.max()) == 0:
+            if verbose:
+                print(f"No more dense boxes found — "
+                      f"{len(active_indices)} points remain uncovered.")
+            break
 
         best_voxel_idx = cp.argmax(hist)
         best_voxel = cp.stack(cp.unravel_index(best_voxel_idx, hist.shape))
-        best_start_vox = cp.clip(
-            best_voxel - box_vox // 2, 0, cp.array(grid_shape) - box_vox
-        )
-        best_end_vox = best_start_vox + box_vox
-
-        best_count = int(box_sum(integral, best_start_vox, best_end_vox))
-        if best_count <= 0:
-            if verbose:
-                print("No more dense boxes found.")
-            break
+        best_start_vox = cp.clip(best_voxel - box_vox // 2, 0, grid_cp - box_vox)
 
         start = best_start_vox * vox
         end = start + box_size
 
-        mask = mask_coords_gpu(coords[active_mask], start, end)
-        covered = int(cp.sum(mask).get())
+        mask = mask_coords_gpu(coords[active_indices], start, end)
+        covered = int(cp.sum(mask))
+        if covered == 0:
+            if verbose:
+                print(f"Warning: densest voxel {best_voxel.tolist()} "
+                      f"(hist={int(hist.max())}) produced a box "
+                      f"[{start.tolist()}, {end.tolist()}) covering 0 points. "
+                      f"coords range: min={coords[active_indices].min(axis=0).tolist()}, "
+                      f"max={coords[active_indices].max(axis=0).tolist()}")
+            break
 
-        active_indices = cp.where(active_mask)[0]
-        ids = active_indices[mask].get()
-
-        box_cells.append(ids)
+        covered_global = active_indices[mask]
+        box_cells.append(covered_global.get())
         boxes.append((cp.asnumpy(start), cp.asnumpy(end)))
 
-        active_mask[active_indices[mask]] = False
+        # Subtract covered points from histogram in-place (O(covered), not O(N)).
+        covered_bins = bins[covered_global]
+        flat_idx = (
+            covered_bins[:, 0] * (grid_shape[1] * grid_shape[2])
+            + covered_bins[:, 1] * grid_shape[2]
+            + covered_bins[:, 2]
+        )
+        hist -= cp.bincount(flat_idx, minlength=hist.size).reshape(grid_shape).astype(hist.dtype)
+
+        active_indices = active_indices[~mask]
         pbar.update(covered)
 
     pbar.close()

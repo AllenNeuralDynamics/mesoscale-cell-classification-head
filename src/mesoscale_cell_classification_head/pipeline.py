@@ -264,7 +264,6 @@ def train(
             feats, valid_mask = extract_feature_vectors_torch(
                 feature_map=fm,
                 roi_centers_zyx=batch_points[bidx],
-                sub_volume_shape=batch_chunks[bidx].shape,
                 jump=cfg["jump"],
                 return_mask=True,
             )
@@ -349,7 +348,8 @@ def _iter_cell_features(
     device: torch.device,
     cfg: dict,
     desc: str = "Feature extraction",
-    val_transform: Callable = None
+    val_transform: Callable = None,
+    pool: bool = True,
 ) -> Iterator[tuple[torch.Tensor, np.ndarray]]:
     """Yield per-cell feature vectors and world coordinates for every box.
 
@@ -415,9 +415,9 @@ def _iter_cell_features(
             feats, valid_mask = extract_feature_vectors_torch(
                 feature_map=fm,
                 roi_centers_zyx=batch_points[bidx],
-                sub_volume_shape=batch_chunks[bidx].shape,
                 jump=cfg["jump"],
                 return_mask=True,
+                pool=pool,
             )
             if len(feats) == 0:
                 continue

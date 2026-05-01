@@ -1,3 +1,4 @@
+"""Get index of benchmark dataset on s3."""
 import os
 import re
 
@@ -13,8 +14,7 @@ def parse_s3_dataset(bucket: str) -> dict:
 
     Returns
     -------
-    dict
-        {
+    dict{
             "<ID>": {
                 "<channel>": {
                     "cells":     [(z, y, x), ...],

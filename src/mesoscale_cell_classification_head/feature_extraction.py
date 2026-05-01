@@ -132,16 +132,11 @@ def run_batch(
 def extract_feature_vectors_torch(
     feature_map: torch.Tensor,
     roi_centers_zyx: np.ndarray | torch.Tensor,
-    sub_volume_shape: tuple[int, int, int],
     jump: int,
     return_mask: bool = True,
+    pool: bool = True,
 ) -> tuple[torch.Tensor, np.ndarray] | torch.Tensor:
     """Extract per-cell feature vectors from a spatial feature map.
-
-    A single ``avg_pool3d`` pass is applied to the full feature map; then
-    feature vectors are read off at the (scaled) cell centre locations.
-    This is equivalent to local mean-pooling but avoids an explicit loop
-    over cells.
 
     Parameters
     ----------
@@ -150,15 +145,19 @@ def extract_feature_vectors_torch(
     roi_centers_zyx : np.ndarray or torch.Tensor
         ``(N, 3)`` array of cell centre coordinates in the sub-volume frame
         ``(z, y, x)``.
-    sub_volume_shape : tuple[int, int, int]
-        Shape ``(D, H, W)`` of the original image chunk that produced
-        ``feature_map``.
     jump : int
         Desired local neighbourhood radius in image voxels; converted to
-        feature-map voxels using the downsampling factors.
+        feature-map voxels using the downsampling factors.  Ignored when
+        ``pool=False``.
     return_mask : bool
         When ``True`` return a ``(feats, valid_mask)`` tuple where
         ``valid_mask`` flags which of the input centres fell inside the map.
+    pool : bool
+        When ``True`` (default) apply ``avg_pool3d`` over a ``jump``-radius
+        neighbourhood before reading off features — smooths positional jitter,
+        better for unsupervised clustering.  When ``False`` read the raw
+        patch-level feature directly — preserves spatial detail, better for
+        supervised MLP classification.
 
     Returns
     -------
@@ -171,13 +170,13 @@ def extract_feature_vectors_torch(
     """
     device = feature_map.device
     C, Dz, Dy, Dx = feature_map.shape
-    D, H, W = sub_volume_shape
 
-    fz, fy, fx = D / Dz, H / Dy, W / Dx
-
-    size_z = min(max(1, int(math.ceil(jump / fz))), Dz)
-    size_y = min(max(1, int(math.ceil(jump / fy))), Dy)
-    size_x = min(max(1, int(math.ceil(jump / fx))), Dx)
+    # Padding in run_batch is appended at the END, so voxel 0 in the original
+    # chunk maps to voxel 0 in the padded 128³ encoder input.  Patch i always
+    # covers image voxels [i*p, i*p+p) regardless of whether the chunk is
+    # smaller than 128 at a volume edge.
+    _enc = 128  # run_batch always pads to this size
+    fz, fy, fx = _enc / Dz, _enc / Dy, _enc / Dx
 
     centers = torch.as_tensor(roi_centers_zyx, device=device, dtype=torch.float32)
     cz = torch.round(centers[:, 0] / fz).long()
@@ -194,17 +193,23 @@ def extract_feature_vectors_torch(
 
     cz, cy, cx = cz[valid], cy[valid], cx[valid]
 
-    pooled = F.avg_pool3d(
-        feature_map.unsqueeze(0),
-        kernel_size=(size_z, size_y, size_x),
-        stride=1,
-        padding=0,
-    ).squeeze(0)
+    if pool:
+        size_z = min(max(1, int(math.ceil(jump / fz))), Dz)
+        size_y = min(max(1, int(math.ceil(jump / fy))), Dy)
+        size_x = min(max(1, int(math.ceil(jump / fx))), Dx)
+        source = F.avg_pool3d(
+            feature_map.unsqueeze(0),
+            kernel_size=(size_z, size_y, size_x),
+            stride=1,
+            padding=0,
+        ).squeeze(0)
+    else:
+        source = feature_map
 
-    cz = torch.clamp(cz, 0, pooled.shape[1] - 1)
-    cy = torch.clamp(cy, 0, pooled.shape[2] - 1)
-    cx = torch.clamp(cx, 0, pooled.shape[3] - 1)
+    cz = torch.clamp(cz, 0, source.shape[1] - 1)
+    cy = torch.clamp(cy, 0, source.shape[2] - 1)
+    cx = torch.clamp(cx, 0, source.shape[3] - 1)
 
-    feats = pooled[:, cz, cy, cx].T  # (N_valid, C)
+    feats = source[:, cz, cy, cx].T  # (N_valid, C)
 
     return (feats, valid.cpu().numpy()) if return_mask else feats
