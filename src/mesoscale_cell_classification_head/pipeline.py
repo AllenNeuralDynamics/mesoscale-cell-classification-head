@@ -69,7 +69,7 @@ def _default_config(
         "head_batch_size": 1024,
         "remove_cls_token": True,
         "remove_register_tokens": True,
-        "cube_size": 30,
+        "cube_size": 6,
     }
 
 def load_data(

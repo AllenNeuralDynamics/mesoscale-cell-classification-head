@@ -63,8 +63,8 @@ def run_batch(
     batch_chunks: list[np.ndarray],
     reconstruction_model: object,
     device: torch.device,
-    remove_cls_token: bool = False,
-    remove_register_tokens: bool = False,
+    remove_cls_token: bool = True,
+    remove_register_tokens: bool = True,
     array_shape: tuple[int, int, int] = (128, 128, 128),
     preprocessing_func: torch.nn.Module | None = None,
 ) -> torch.Tensor:
@@ -99,13 +99,6 @@ def run_batch(
     """
     n_cls = 1
     n_register_tokens = reconstruction_model.model.encoder.n_register_tokens
-
-    # padded = [
-    #     pad_to_shape(arr, target_shape=array_shape, mode="constant", constant_values=0)
-    #     for arr in batch_chunks
-    # ]
-    # stacked = np.stack(padded)
-    # batch = torch.from_numpy(stacked).unsqueeze(1).to(device).half()
 
     with torch.inference_mode():
         batch = torch.stack([
@@ -289,15 +282,8 @@ def extract_feature_vectors_torch_3d(
     offsets = torch.arange(-radius, radius, device=device)
     zz, yy, xx = torch.meshgrid(offsets, offsets, offsets, indexing="ij")
 
-    subvols = []
-    for z, y, x in zip(cz, cy, cx):
-        sub = feature_map_pad[
-            z + zz,
-            y + yy,
-            x + xx,
-            :,
-        ]  # (K, K, K, C)
-        subvols.append(sub)
-
-    subvols = torch.stack(subvols, dim=0)  # (N, K, K, K, C)
+    iz = (cz[:, None, None, None] + zz[None]).clamp(0, feature_map_pad.shape[0] - 1)
+    iy = (cy[:, None, None, None] + yy[None]).clamp(0, feature_map_pad.shape[1] - 1)
+    ix = (cx[:, None, None, None] + xx[None]).clamp(0, feature_map_pad.shape[2] - 1)
+    subvols = feature_map_pad[iz, iy, ix, :]  # (N, K, K, K, C)
     return (subvols, valid.cpu().numpy()) if return_mask else subvols
