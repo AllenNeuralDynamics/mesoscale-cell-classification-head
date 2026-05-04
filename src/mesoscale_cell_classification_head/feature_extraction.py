@@ -63,9 +63,9 @@ def run_batch(
     batch_chunks: list[np.ndarray],
     reconstruction_model: object,
     device: torch.device,
-    n_skip_tokens: int = 2,
+    remove_cls_token: bool = True,
+    remove_register_tokens: bool = True,
     array_shape: tuple[int, int, int] = (128, 128, 128),
-    patch_shape: tuple[int, int, int] = (4, 4, 4),
     preprocessing_func: torch.nn.Module | None = None,
 ) -> torch.Tensor:
     """Forward a list of 3-D image chunks through the MAE encoder.
@@ -86,14 +86,10 @@ def run_batch(
         ``device`` and set to eval mode.
     device : torch.device
         Target compute device.
-    n_skip_tokens : int
-        Number of leading tokens to discard from the encoder output
-        (e.g. CLS/register tokens).
+    remove_cls_token : bool
+        Whether to remove the CLS token from the encoder output.
     array_shape : tuple[int, int, int]
         Shape ``(D, H, W)`` to which each input chunk is padded.
-    patch_shape : tuple[int, int, int]
-        Shape ``(Pd, Ph, Pw)`` of the patches used by the MAE encoder;
-        used to compute the spatial dimensions of the output feature map.
 
     Returns
     -------
@@ -101,30 +97,50 @@ def run_batch(
         Feature maps of shape ``(B, C, Dz, Dy, Dx)`` on ``device``,
         in float16 precision.
     """
-    voxels_per_patch = tuple(
-        array_shape[idx] // patch_shape[idx]
-        for idx in range(len(array_shape))
-    )
+    n_cls = 1
+    n_register_tokens = reconstruction_model.model.encoder.n_register_tokens
 
-    padded = [
-        pad_to_shape(arr, target_shape=array_shape, mode="constant", constant_values=0)
-        for arr in batch_chunks
-    ]
-    stacked = np.stack(padded)
-    batch = torch.from_numpy(stacked).unsqueeze(1).to(device).half()
+    with torch.inference_mode():
+        batch = torch.stack([
+            torch.as_tensor(
+                pad_to_shape(arr, array_shape, mode="constant", constant_values=0)
+            )
+            for arr in batch_chunks
+        ], dim=0).unsqueeze(1).to(device, dtype=torch.float16)
 
-    if preprocessing_func is not None:
-        batch = preprocessing_func(batch)
+        if preprocessing_func is not None:
+            batch = preprocessing_func(batch)
 
-    with torch.no_grad():
         feature_image, _, _, _, _, _ = reconstruction_model.model.encoder(
             batch.half(), mask_ratio=0.0, recover_layers=()
         )
-        feature_image = feature_image[:, n_skip_tokens:, :]
-        feature_image = torch.reshape(
-            feature_image, (feature_image.shape[0], *voxels_per_patch, -1)
-        )
-        feature_image = torch.moveaxis(feature_image, -1, 1)
+
+        start = 0
+        parts = []
+
+        if not remove_cls_token:
+            parts.append(feature_image[:, start:start+n_cls, :])
+        start += n_cls
+
+        if not remove_register_tokens:
+            parts.append(feature_image[:, start:start+n_register_tokens, :])
+        start += n_register_tokens
+
+        parts.append(feature_image[:, start:, :])
+
+        feature_image = torch.cat(parts, dim=1)
+
+        # Reshape pure patch-token output to spatial feature map (B, C, Dg, Hg, Wg).
+        # Only valid when CLS and register tokens are removed (the default), leaving
+        # exactly Dg*Hg*Wg tokens that map one-to-one onto the spatial grid.
+        B, N_tokens, C_out = feature_image.shape
+        Dg, Hg, Wg = reconstruction_model.model.encoder.grid_size
+        if N_tokens == Dg * Hg * Wg:
+            feature_image = (
+                feature_image.reshape(B, Dg, Hg, Wg, C_out)
+                .permute(0, 4, 1, 2, 3)
+                .contiguous()
+            )
 
     return feature_image
 
@@ -132,51 +148,41 @@ def run_batch(
 def extract_feature_vectors_torch(
     feature_map: torch.Tensor,
     roi_centers_zyx: np.ndarray | torch.Tensor,
-    jump: int,
     return_mask: bool = True,
-    pool: bool = True,
+    pad_size: int = 128,
 ) -> tuple[torch.Tensor, np.ndarray] | torch.Tensor:
     """Extract per-cell feature vectors from a spatial feature map.
+
+    Maps each cell centre to the nearest patch token and returns that token's
+    embedding.  Each MAE patch token already encodes the full local voxel
+    neighbourhood (patch_size³), making this the most discriminative
+    per-cell representation for a flat MLP classifier.
 
     Parameters
     ----------
     feature_map : torch.Tensor
-        ``(C, Dz, Dy, Dx)`` feature map on GPU.
+        ``(C, Dz, Dy, Dx)`` feature map, channels-first, on GPU.
+        This is the direct output of :func:`run_batch` indexed at batch dim.
     roi_centers_zyx : np.ndarray or torch.Tensor
-        ``(N, 3)`` array of cell centre coordinates in the sub-volume frame
-        ``(z, y, x)``.
-    jump : int
-        Desired local neighbourhood radius in image voxels; converted to
-        feature-map voxels using the downsampling factors.  Ignored when
-        ``pool=False``.
+        ``(N, 3)`` cell centre coordinates in the sub-volume frame ``(z, y, x)``.
     return_mask : bool
-        When ``True`` return a ``(feats, valid_mask)`` tuple where
-        ``valid_mask`` flags which of the input centres fell inside the map.
-    pool : bool
-        When ``True`` (default) apply ``avg_pool3d`` over a ``jump``-radius
-        neighbourhood before reading off features — smooths positional jitter,
-        better for unsupervised clustering.  When ``False`` read the raw
-        patch-level feature directly — preserves spatial detail, better for
-        supervised MLP classification.
+        When ``True`` return ``(feats, valid_mask)`` where ``valid_mask``
+        flags centres that fell inside the map.
+    pad_size : int
+        Size to which each chunk was padded by :func:`run_batch`; used to
+        convert image-space coordinates to patch-space indices.
 
     Returns
     -------
     feats : torch.Tensor
-        ``(N_valid, C)`` feature matrix on the same device as
-        ``feature_map``.
+        ``(N_valid, C)`` feature matrix on the same device as ``feature_map``.
     valid_mask : np.ndarray
-        Boolean array of shape ``(N,)`` indicating valid centres.
-        Only returned when ``return_mask=True``.
+        Boolean ``(N,)`` array. Only returned when ``return_mask=True``.
     """
     device = feature_map.device
     C, Dz, Dy, Dx = feature_map.shape
 
-    # Padding in run_batch is appended at the END, so voxel 0 in the original
-    # chunk maps to voxel 0 in the padded 128³ encoder input.  Patch i always
-    # covers image voxels [i*p, i*p+p) regardless of whether the chunk is
-    # smaller than 128 at a volume edge.
-    _enc = 128  # run_batch always pads to this size
-    fz, fy, fx = _enc / Dz, _enc / Dy, _enc / Dx
+    fz, fy, fx = pad_size / Dz, pad_size / Dy, pad_size / Dx
 
     centers = torch.as_tensor(roi_centers_zyx, device=device, dtype=torch.float32)
     cz = torch.round(centers[:, 0] / fz).long()
@@ -184,32 +190,100 @@ def extract_feature_vectors_torch(
     cx = torch.round(centers[:, 2] / fx).long()
 
     valid = (
-        (cz >= 0) & (cz < Dz) & (cy >= 0) & (cy < Dy) & (cx >= 0) & (cx < Dx)
+        (cz >= 0) & (cz < Dz) &
+        (cy >= 0) & (cy < Dy) &
+        (cx >= 0) & (cx < Dx)
     )
 
     if not valid.any():
-        empty: torch.Tensor = torch.empty(0, C, device=device)
+        empty = torch.empty(0, C, device=device)
+        return (empty, valid.cpu().numpy()) if return_mask else empty
+
+    cz = torch.clamp(cz[valid], 0, Dz - 1)
+    cy = torch.clamp(cy[valid], 0, Dy - 1)
+    cx = torch.clamp(cx[valid], 0, Dx - 1)
+
+    feats = feature_map[:, cz, cy, cx].T  # (N_valid, C)
+    return (feats, valid.cpu().numpy()) if return_mask else feats
+
+
+def extract_feature_vectors_torch_3d(
+    feature_map: torch.Tensor,
+    roi_centers_zyx: np.ndarray | torch.Tensor,
+    return_mask: bool = True,
+    cube_size: int = 6,
+    pad_size: int = 128,
+) -> tuple[torch.Tensor, np.ndarray] | torch.Tensor:
+    """Extract a spatial patch cube around each cell centre.
+
+    Returns a ``(K, K, K, C)`` cube of patch tokens per cell, useful for
+    visualisation (PCA, attention maps) or a 3-D CNN classifier head.
+    For a flat MLP, prefer :func:`extract_feature_vectors_torch` instead.
+
+    Parameters
+    ----------
+    feature_map : torch.Tensor
+        ``(Dz, Dy, Dx, C)`` feature map, channels-last.
+        Build it from the :func:`run_batch` output via
+        ``fm.permute(1, 2, 3, 0)`` or the reshape path in
+        :func:`_iter_cell_features` with ``use_3d_features=True``.
+    roi_centers_zyx : np.ndarray or torch.Tensor
+        ``(N, 3)`` cell centre coordinates in the sub-volume frame ``(z, y, x)``.
+    return_mask : bool
+        When ``True`` return ``(feats, valid_mask)``.
+    cube_size : int
+        Side length of the extracted patch cube in patch units.
+    pad_size : int
+        Size to which each chunk was padded by :func:`run_batch`.
+
+    Returns
+    -------
+    feats : torch.Tensor
+        ``(N_valid, K, K, K, C)`` patch cubes on the same device.
+    valid_mask : np.ndarray
+        Boolean ``(N,)`` array. Only returned when ``return_mask=True``.
+    """
+    device = feature_map.device
+    Dz, Dy, Dx, C = feature_map.shape
+    radius = cube_size // 2
+
+    fz, fy, fx = pad_size / Dz, pad_size / Dy, pad_size / Dx
+
+    centers = torch.as_tensor(roi_centers_zyx, device=device, dtype=torch.float32)
+
+    cz = torch.round(centers[:, 0] / fz).long()
+    cy = torch.round(centers[:, 1] / fy).long()
+    cx = torch.round(centers[:, 2] / fx).long()
+
+    valid = (
+        (cz >= 0) & (cz < Dz) &
+        (cy >= 0) & (cy < Dy) &
+        (cx >= 0) & (cx < Dx)
+    )
+
+    if not valid.any():
+        empty = torch.empty(0, cube_size, cube_size, cube_size, C, device=device)
         return (empty, valid.cpu().numpy()) if return_mask else empty
 
     cz, cy, cx = cz[valid], cy[valid], cx[valid]
 
-    if pool:
-        size_z = min(max(1, int(math.ceil(jump / fz))), Dz)
-        size_y = min(max(1, int(math.ceil(jump / fy))), Dy)
-        size_x = min(max(1, int(math.ceil(jump / fx))), Dx)
-        source = F.avg_pool3d(
-            feature_map.unsqueeze(0),
-            kernel_size=(size_z, size_y, size_x),
-            stride=1,
-            padding=0,
-        ).squeeze(0)
-    else:
-        source = feature_map
+    # Pad the feature map so cubes centred near the boundary stay in-bounds
+    feature_map_pad = F.pad(
+        feature_map.permute(3, 0, 1, 2),          # (C, Dz, Dy, Dx) for F.pad
+        (radius, radius, radius, radius, radius, radius),
+        mode="constant",
+        value=0,
+    ).permute(1, 2, 3, 0)                          # back to (Dz+2r, Dy+2r, Dx+2r, C)
 
-    cz = torch.clamp(cz, 0, source.shape[1] - 1)
-    cy = torch.clamp(cy, 0, source.shape[2] - 1)
-    cx = torch.clamp(cx, 0, source.shape[3] - 1)
+    cz = cz + radius
+    cy = cy + radius
+    cx = cx + radius
 
-    feats = source[:, cz, cy, cx].T  # (N_valid, C)
+    offsets = torch.arange(-radius, radius, device=device)
+    zz, yy, xx = torch.meshgrid(offsets, offsets, offsets, indexing="ij")
 
-    return (feats, valid.cpu().numpy()) if return_mask else feats
+    iz = (cz[:, None, None, None] + zz[None]).clamp(0, feature_map_pad.shape[0] - 1)
+    iy = (cy[:, None, None, None] + yy[None]).clamp(0, feature_map_pad.shape[1] - 1)
+    ix = (cx[:, None, None, None] + xx[None]).clamp(0, feature_map_pad.shape[2] - 1)
+    subvols = feature_map_pad[iz, iy, ix, :]  # (N, K, K, K, C)
+    return (subvols, valid.cpu().numpy()) if return_mask else subvols
